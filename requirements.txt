@@ -1,0 +1,6 @@
+requests
+musicbrainzngs
+rich
+lyricsgenius
+yt-dlp
+mutagen
