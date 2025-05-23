@@ -30,16 +30,20 @@ COVER_DIR = Path("downloads/covers")
 SORTED_DIR = Path("Sorted")
 DB_PATH = Path("downloads.db")
 USER_AGENT = "YTMusicDownloader/2.0 (https://yourwebsite.example.com)"
-LOG_FILE = "application.txt" # Define the log file name
 
 # Set the user agent for MusicBrainz
 set_useragent("YTMusicDownloader", "2.0", "https://yourwebsite.example.com")
 
 # Use your Genius token below
-GENIUS_TOKEN = "4LJb8knqz8-bSU5Xcn_x6pCrtDDZed2xnZqXtix6rUDNueyXiRrggf_QS40Iym93"
-genius = Genius(GENIUS_TOKEN) if GENIUS_TOKEN else None
+GENIUS_TOKEN = os.getenv("LYRICSGENIUS_TOKEN")
+genius = None
+if GENIUS_TOKEN:
+    genius = Genius(GENIUS_TOKEN)
+else:
+    logging.warning("LYRICSGENIUS_TOKEN environment variable not set. Lyrics fetching will be disabled.")
 
 # --- Logging Setup ---
+LOG_FILE = "application.txt" # Define the log file name
 # Get the root logger
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO) # Set the overall logging level
@@ -54,6 +58,11 @@ for handler in root_logger.handlers[:]:
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 root_logger.addHandler(console_handler)
+
+# Create a file handler with mode='w' (to overwrite), set its formatter, and add it to the root logger
+file_handler = logging.FileHandler(LOG_FILE, mode='w')
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+root_logger.addHandler(file_handler)
 
 # --- Helper Functions ---
 def check_dependencies():
@@ -172,25 +181,50 @@ def download_audio(entry, rate_limit):
 
 def fetch_metadata(video_id, title, artist):
     logging.info(f"Fetching metadata for '{title}' by '{artist}' from MusicBrainz and YouTube.")
-    try:
-        result = search_recordings(recording=title, artist=artist, limit=5)
-        for recording in result.get("recording-list", []):
-            for release in recording.get("release-list", []):
-                if 'secondary-type-list' in release and 'Compilation' in release['secondary-type-list']:
-                    continue
-                if release.get('release-group', {}).get('primary-type') == 'Album':
-                    album = release.get('title', title)
-                    logging.info(f"Found MusicBrainz metadata: Album='{album}', Track='{recording.get('position', '1')}'.")
-                    return {
-                        'album': album,
-                        'tracknumber': recording.get('position', '1'),
-                        'release_id': release.get('id')
-                    }
-        logging.info(f"No suitable album metadata found on MusicBrainz for '{title}' by '{artist}'.")
-    except Exception as e:
-        logging.warning(f"Error fetching metadata from MusicBrainz for '{title} - {artist}': {e}. Trying YouTube as fallback.")
-        sleep(1) # Be nice to the API
+    mb_result = None
+    for attempt in range(3):
+        try:
+            result = search_recordings(recording=title, artist=artist, limit=5)
+            for recording in result.get("recording-list", []):
+                for release in recording.get("release-list", []):
+                    if 'secondary-type-list' in release and 'Compilation' in release['secondary-type-list']:
+                        continue
+                    if release.get('release-group', {}).get('primary-type') == 'Album':
+                        album = release.get('title', title)
+                        logging.info(f"Found MusicBrainz metadata: Album='{album}', Track='{recording.get('position', '1')}'.")
+                        mb_result = {
+                            'album': album,
+                            'tracknumber': recording.get('position', '1'),
+                            'release_id': release.get('id')
+                        }
+                        break  # Found suitable release
+                if mb_result:
+                    break  # Found suitable recording
+            if mb_result:
+                break  # Successfully fetched and processed MusicBrainz data
+            else: # No exception, but no suitable metadata found
+                logging.info(f"No suitable album metadata found on MusicBrainz for '{title}' by '{artist}' (attempt {attempt + 1}/3).")
+                # Don't retry if no error, just no data. Fall through to YouTube if all attempts find nothing.
+                # However, if we want to retry "not found", remove this 'else' and the break below it.
+                # For now, let's assume "not found" is not an error to retry.
+                # If an actual error occurs, the except block will handle retries.
+                # If MusicBrainz returns empty results consistently, we don't want to loop unnecessarily.
+                # Let's break here to fall through to YouTube if no data after first successful API call.
+                # This means we only retry on actual exceptions.
+                break # Exit loop if API call succeeded but no data found.
 
+        except Exception as e: # Covers network errors, API issues, etc.
+            logging.warning(f"MusicBrainz API error (attempt {attempt + 1}/3) for '{title}' by '{artist}': {e}. Retrying in 2 seconds...")
+            if attempt < 2:  # Don't sleep after the last attempt
+                sleep(2)
+            else:
+                logging.error(f"Failed to fetch metadata from MusicBrainz for '{title}' by '{artist}' after 3 attempts.")
+    
+    if mb_result:
+        return mb_result
+
+    # Fallback to YouTube metadata if MusicBrainz fails or no data found
+    logging.info(f"Trying YouTube as fallback for metadata for '{title}' by '{artist}'.")
     try:
         with yt_dlp.YoutubeDL({"quiet": True, "extract_flat": True, "useragent": USER_AGENT}) as ydl:
             info_dict = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
@@ -242,15 +276,23 @@ def fetch_youtube_thumbnail(video_id):
 def fetch_lyrics(title, artist):
     logging.info(f"Attempting to fetch lyrics for '{title}' by '{artist}'.")
     if genius:
-        try:
-            song = genius.search_song(title, artist)
-            if song and song.lyrics:
-                logging.info(f"Successfully fetched lyrics for '{title}' by '{artist}'.")
-                return song.lyrics
-            logging.warning(f"Lyrics not found on Genius for '{title}' by '{artist}'.")
-        except Exception:
-            logging.warning(f"Error fetching lyrics for '{title} - {artist}' from Genius. Retrying after a short delay.")
-            sleep(1) # Be nice to the API
+        for attempt in range(3):
+            try:
+                song = genius.search_song(title, artist)
+                if song and song.lyrics:
+                    logging.info(f"Successfully fetched lyrics for '{title}' by '{artist}'.")
+                    return song.lyrics
+                # If song or lyrics not found, but no exception, don't retry, just log warning.
+                # This assumes that not finding lyrics is not an error state to retry.
+                logging.warning(f"Lyrics not found on Genius for '{title}' by '{artist}' (attempt {attempt + 1}/3).")
+                break # Break if search was successful but no lyrics (to avoid retrying "not found")
+            except Exception as e: # Catch appropriate Genius library exceptions if known, else generic Exception
+                logging.warning(f"Genius API error (attempt {attempt + 1}/3) for '{title}' by '{artist}': {e}. Retrying in 2 seconds...")
+                if attempt < 2:
+                    sleep(2)
+                else:
+                    logging.error(f"Failed to fetch lyrics from Genius for '{title}' by '{artist}' after 3 attempts.")
+        # Fall through to return default message if all attempts fail or lyrics not found
     else:
         logging.warning("Genius token not provided. Skipping lyrics fetching.")
     return f"Lyrics for {title} by {artist} not found."
@@ -410,29 +452,6 @@ def process_track(entry):
         logging.error(f"Failed to organize track: '{title}' by '{artist}'.")
 
 def main():
-    # Before starting the application logic, clear the previous log file
-    # and re-add the file handler to ensure a fresh log file.
-    if os.path.exists(LOG_FILE):
-        try:
-            os.remove(LOG_FILE)
-            # Log this to console, as the file handler might be closed or not yet re-initialized
-            print(f"INFO: Cleared previous log file: {LOG_FILE}")
-        except OSError as e:
-            print(f"ERROR: Error clearing previous log file {LOG_FILE}: {e}")
-
-    # Remove existing file handlers from the root logger to prevent appending to old file
-    # This loop is crucial if the script is run multiple times within the same process
-    # (e.g., in an IDE or interactive shell)
-    for handler in root_logger.handlers[:]:
-        if isinstance(handler, logging.FileHandler):
-            handler.close()
-            root_logger.removeHandler(handler)
-
-    # Add a new FileHandler with 'w' mode to create a fresh log file for this run
-    file_handler = logging.FileHandler(LOG_FILE, mode='w')
-    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-    root_logger.addHandler(file_handler)
-
     logging.info("Application started.")
     check_dependencies()
     setup_dirs()
